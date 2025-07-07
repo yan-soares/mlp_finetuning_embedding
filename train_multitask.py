@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
-from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup, DebertaV2Model, DebertaV2Tokenizer
 from tqdm.auto import tqdm
 import numpy as np
 import logging
@@ -15,17 +15,55 @@ logging.basicConfig(format='%(asctime)s - %(message)s',
                     level=logging.INFO)
 
 # ===== CONFIG =====
-DATA_PATH = "/home/yansoares/pooling_paper/data/downstream"
+DATA_PATH = "/home/yansoares/mlp_finetuning_embedding/data"
 MODEL_NAME = "microsoft/deberta-v3-base" 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
-EPOCHS = 50 
+EPOCHS = 50
 MAX_LEN = 512 
 LEARNING_RATE = 2e-5
 EARLY_STOPPING_PATIENCE = 5
-SAVE_DIR = "final_multitask_training_models_new_03072025"
+SAVE_DIR = "/home/yansoares/mlp_finetuning_embedding_models/review"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
+# Funções de carregar dataset (mantidas como estavam)
+def load_binary_dataset(pos_path, neg_path):
+    with open(pos_path, "r", encoding="latin1") as f: pos = [line.strip() for line in f]
+    with open(neg_path, "r", encoding="latin1") as f: neg = [line.strip() for line in f]
+    return pos + neg, [1]*len(pos) + [0]*len(neg)
+
+def load_sst_dataset(path):
+    texts, labels = [], []
+    with open(path, "r", encoding="utf-8") as f:
+        next(f)
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) == 2:
+                texts.append(parts[0])
+                labels.append(int(parts[1]))
+    return texts, labels
+
+def load_trec_dataset(path):
+    texts, labels_str = [], []
+    with open(path, "r", encoding="latin1") as f:
+        for line in f:
+            parts = line.strip().split(" ", 1)
+            if len(parts) == 2:
+                labels_str.append(parts[0].split(":")[0])
+                texts.append(parts[1])
+    label_to_id = {label: idx for idx, label in enumerate(sorted(set(labels_str)))}
+    return texts, [label_to_id[l] for l in labels_str]
+
+def load_mrpc_dataset(path):
+    texts, labels = [], []
+    with open(path, "r", encoding="utf-8") as f:
+        next(f)
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) == 5:
+                texts.append(parts[3] + " [SEP] " + parts[4])
+                labels.append(int(parts[0]))
+    return texts, labels
 
 # ===================================================================
 # ===== ARQUITETURA DO MODELO (MODIFICADO PARA MULTITASK) =====
@@ -53,14 +91,10 @@ class LayerAggregator(nn.Module):
         x = self.combiner(x)
         return x.squeeze(-1)
 
-# MODIFICADO: O classificador agora tem "cabeças" separadas para cada tarefa
-# MODIFICAÇÃO NA CLASSE CustomClassifier
-
 class CustomClassifier(nn.Module):
     def __init__(self, model_name: str, task_config: dict):
-        # ... (o __init__ continua exatamente o mesmo)
         super().__init__()
-        self.base_model = AutoModel.from_pretrained(model_name, output_hidden_states=True)
+        self.base_model = DebertaV2Model.from_pretrained(model_name, output_hidden_states=True)
         hidden_size = self.base_model.config.hidden_size
         num_layers = self.base_model.config.num_hidden_layers
         self.layer_poolers = nn.ModuleList([LearnablePooling(hidden_size) for _ in range(num_layers)])
@@ -109,10 +143,6 @@ class CustomClassifier(nn.Module):
         with torch.no_grad(): # Desativa o cálculo de gradientes para economizar memória e tempo
             embedding = self.get_embedding_base(input_ids, attention_mask)
         return embedding
-    
-# ===================================================================
-# ===== DATA HANDLING (MODIFICADO PARA MULTITASK) =====
-# ===================================================================
 
 # NOVO: Dataset que lida com múltiplas tarefas
 class MultitaskDataset(Dataset):
@@ -166,52 +196,13 @@ class MultitaskDataset(Dataset):
             'task_ids': torch.tensor(task_id, dtype=torch.long) # NOVO: Retorna o ID da tarefa
         }
 
-# Funções de carregar dataset (mantidas como estavam)
-def load_binary_dataset(pos_path, neg_path):
-    with open(pos_path, "r", encoding="latin1") as f: pos = [line.strip() for line in f]
-    with open(neg_path, "r", encoding="latin1") as f: neg = [line.strip() for line in f]
-    return pos + neg, [1]*len(pos) + [0]*len(neg)
-
-def load_sst_dataset(path):
-    texts, labels = [], []
-    with open(path, "r", encoding="utf-8") as f:
-        next(f)
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) == 2:
-                texts.append(parts[0])
-                labels.append(int(parts[1]))
-    return texts, labels
-
-def load_trec_dataset(path):
-    texts, labels_str = [], []
-    with open(path, "r", encoding="latin1") as f:
-        for line in f:
-            parts = line.strip().split(" ", 1)
-            if len(parts) == 2:
-                labels_str.append(parts[0].split(":")[0])
-                texts.append(parts[1])
-    label_to_id = {label: idx for idx, label in enumerate(sorted(set(labels_str)))}
-    return texts, [label_to_id[l] for l in labels_str]
-
-def load_mrpc_dataset(path):
-    texts, labels = [], []
-    with open(path, "r", encoding="utf-8") as f:
-        next(f)
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) == 5:
-                texts.append(parts[3] + " [SEP] " + parts[4])
-                labels.append(int(parts[0]))
-    return texts, labels
-
 # ===================================================================
 # ===== MAIN TRAINING SCRIPT (MODIFICADO PARA MULTITASK) =====
 # ===================================================================
 
 def main():
     print(f"Usando dispositivo: {DEVICE}")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = DebertaV2Tokenizer.from_pretrained(MODEL_NAME)
 
     datasets_raw = {
         "MR": load_binary_dataset(os.path.join(DATA_PATH, "MR", "rt-polarity.pos"), os.path.join(DATA_PATH, "MR", "rt-polarity.neg")),
@@ -237,7 +228,7 @@ def main():
         full_dataset = MultitaskDataset(train_tasks_data, tokenizer, MAX_LEN)
         
         # Separando treino e validação
-        val_size = int(len(full_dataset) * 0.1)
+        val_size = int(len(full_dataset) * 0.2)
         train_size = len(full_dataset) - val_size
         train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
@@ -269,14 +260,17 @@ def main():
                 labels = batch['labels'].to(DEVICE)
                 task_ids = batch['task_ids'].to(DEVICE)
 
-                model.zero_grad()
+                # MUDANÇA 1: Zeramos os gradientes no início do batch.
+                # Isso garante que estamos começando com gradientes limpos antes de acumulá-los.
+                optimizer.zero_grad()
                 
-                # MODIFICADO: O forward agora precisa dos task_ids
+                # O forward continua o mesmo, calculando logits para todas as tarefas no batch.
                 logits = model(input_ids=input_ids, attention_mask=attention_mask, task_ids=task_ids)
                 
-                # MODIFICADO: Lógica de cálculo da perda (loss) para multitask
-                total_loss_for_batch = 0
-                # Agrupa por task_id para calcular a perda de cada tarefa no batch
+                # MUDANÇA 2: Vamos iterar e fazer a retropropagação para cada tarefa.
+                total_loss_for_logging = 0 # Usaremos isso apenas para o log.
+
+                # Agrupa por task_id para calcular a perda e fazer a retropropagação de cada tarefa.
                 for task_id_val in torch.unique(task_ids):
                     task_mask = (task_ids == task_id_val)
                     
@@ -287,18 +281,25 @@ def main():
                     num_classes_for_task = train_tasks_config[id_to_task_name_map[task_id_val.item()]]
                     task_logits = task_logits[:, :num_classes_for_task]
                     
+                    # Calcula a perda para ESTA tarefa específica
                     loss = criterion(task_logits, task_labels)
-                    total_loss_for_batch += loss
+                    
+                    # MUDANÇA 3: A retropropagação acontece AQUI, dentro do loop.
+                    # Os gradientes de `loss` serão calculados e ACUMULADOS nos parâmetros do modelo.
+                    # Isso inclui a cabeça de classificação da tarefa E os pesos compartilhados (base, poolers, aggregator).
+                    loss.backward()
 
-                if total_loss_for_batch > 0:
-                    total_train_loss += total_loss_for_batch.item()
-                    total_loss_for_batch.backward()
+                    total_loss_for_logging += loss.item()
+
+                total_train_loss += total_loss_for_logging
                 
+                # MUDANÇA 4: As etapas de otimização acontecem DEPOIS do loop.
+                # O otimizador agora age sobre os gradientes acumulados de todas as tarefas do batch.
                 nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
                 
-                progress_bar.set_postfix({'loss': total_loss_for_batch.item() if isinstance(total_loss_for_batch, torch.Tensor) else total_loss_for_batch})
+                progress_bar.set_postfix({'loss': total_loss_for_logging})
             
             avg_train_loss = total_train_loss / len(train_loader)
             print(f'Average training loss: {avg_train_loss:.4f}')
