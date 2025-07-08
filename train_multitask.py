@@ -8,6 +8,7 @@ from tqdm.auto import tqdm
 import numpy as np
 import logging
 from collections import defaultdict
+from torch.amp import autocast, GradScaler
 
 # Configura o logger
 logging.basicConfig(format='%(asctime)s - %(message)s',
@@ -15,7 +16,7 @@ logging.basicConfig(format='%(asctime)s - %(message)s',
                     level=logging.INFO)
 
 # ===== CONFIG =====
-DATA_PATH = "/home/yansoares/mlp_finetuning_embedding/data"
+DATA_PATH = "/home/yansoares/mlp_finetuning_embedding/data/downstream"
 MODEL_NAME = "microsoft/deberta-v3-base" 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
@@ -77,7 +78,11 @@ class LearnablePooling(nn.Module):
     def forward(self, x, attention_mask):
         mask_expanded = attention_mask.unsqueeze(-1).float()
         scores = self.attention_scorer(x)
-        scores[mask_expanded == 0] = -1e9
+        
+        # CORREÇÃO: Em vez de -1e9, use o menor valor que o dtype atual suporta.
+        # Isso evita o overflow quando em precisão mista (float16).
+        scores[mask_expanded == 0] = torch.finfo(scores.dtype).min
+        
         weights = F.softmax(scores, dim=1)
         return (x * weights).sum(dim=1)
 
@@ -112,7 +117,16 @@ class CustomClassifier(nn.Module):
         
         # Roteamento para a cabeça de classificação correta...
         max_num_classes = max(head.out_features for head in self.classifiers.values())
-        all_logits = torch.zeros(final_embedding.size(0), max_num_classes, device=final_embedding.device)
+
+        # CORREÇÃO: Crie o tensor `all_logits` com o mesmo dtype do embedding.
+        # `final_embedding.dtype` será `torch.float16` dentro do autocast.
+        all_logits = torch.zeros(
+            final_embedding.size(0), 
+            max_num_classes, 
+            device=final_embedding.device, 
+            dtype=final_embedding.dtype
+        )
+
         for i, task_name in self.id_to_task_name.items():
             task_mask = (task_ids == i)
             if task_mask.any():
@@ -120,6 +134,7 @@ class CustomClassifier(nn.Module):
                 task_logits = self.classifiers[task_name](task_embedding)
                 num_classes_for_task = task_logits.shape[1]
                 all_logits[task_mask, :num_classes_for_task] = task_logits
+        
         return all_logits
 
     # NOVO: Método base para extrair a parte compartilhada
@@ -243,10 +258,13 @@ def main():
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
         criterion = nn.CrossEntropyLoss().to(DEVICE)
         
+        # PASSO A: Inicialize o GradScaler.
+        scaler = GradScaler()
+
         best_avg_val_accuracy = 0.0
         epochs_no_improve = 0
         
-        id_to_task_name_map = model.id_to_task_name # Mapeamento para logs
+        id_to_task_name_map = model.id_to_task_name
         
         for epoch in range(EPOCHS):
             print(f'\n--- Epoch {epoch + 1}/{EPOCHS} ---')
@@ -260,53 +278,54 @@ def main():
                 labels = batch['labels'].to(DEVICE)
                 task_ids = batch['task_ids'].to(DEVICE)
 
-                # MUDANÇA 1: Zeramos os gradientes no início do batch.
-                # Isso garante que estamos começando com gradientes limpos antes de acumulá-los.
                 optimizer.zero_grad()
                 
-                # O forward continua o mesmo, calculando logits para todas as tarefas no batch.
-                logits = model(input_ids=input_ids, attention_mask=attention_mask, task_ids=task_ids)
-                
-                # MUDANÇA 2: Vamos iterar e fazer a retropropagação para cada tarefa.
-                total_loss_for_logging = 0 # Usaremos isso apenas para o log.
+                # PASSO B: O contexto autocast envolve a chamada do modelo.
+                with autocast(device_type='cuda'):
+                    logits = model(input_ids=input_ids, attention_mask=attention_mask, task_ids=task_ids)
+                    
+                    # Lógica do loop de tarefas
+                    unique_task_ids = torch.unique(task_ids)
+                    num_unique_tasks = len(unique_task_ids)
+                    total_loss_for_logging = 0
 
-                # Agrupa por task_id para calcular a perda e fazer a retropropagação de cada tarefa.
-                for task_id_val in torch.unique(task_ids):
-                    task_mask = (task_ids == task_id_val)
-                    
-                    task_logits = logits[task_mask]
-                    task_labels = labels[task_mask]
-                    
-                    # Remove as colunas de padding dos logits
-                    num_classes_for_task = train_tasks_config[id_to_task_name_map[task_id_val.item()]]
-                    task_logits = task_logits[:, :num_classes_for_task]
-                    
-                    # Calcula a perda para ESTA tarefa específica
-                    loss = criterion(task_logits, task_labels)
-                    
-                    # MUDANÇA 3: A retropropagação acontece AQUI, dentro do loop.
-                    # Os gradientes de `loss` serão calculados e ACUMULADOS nos parâmetros do modelo.
-                    # Isso inclui a cabeça de classificação da tarefa E os pesos compartilhados (base, poolers, aggregator).
-                    loss.backward()
+                    for i, task_id_val in enumerate(unique_task_ids):
+                        task_mask = (task_ids == task_id_val)
+                        
+                        # O cálculo da perda da tarefa também deve estar dentro do autocast
+                        task_logits_full = logits[task_mask]
+                        task_labels = labels[task_mask]
+                        
+                        num_classes_for_task = train_tasks_config[id_to_task_name_map[task_id_val.item()]]
+                        task_logits_sliced = task_logits_full[:, :num_classes_for_task]
+                        
+                        loss_per_task = criterion(task_logits_sliced, task_labels)
+                        
+                        total_loss_for_logging += loss_per_task.item()
+                        
+                        # PASSO C: Escale a perda da TAREFA ATUAL e faça o backward.
+                        # A lógica de `retain_graph` é mantida.
+                        retain_graph_needed = (i < num_unique_tasks - 1)
+                        scaler.scale(loss_per_task).backward(retain_graph=retain_graph_needed)
 
-                    total_loss_for_logging += loss.item()
+                # PASSO D: Fora do loop de tarefas, mas dentro do loop do batch.
+                # Otimize os pesos usando os gradientes acumulados de todas as tarefas.
+                scaler.step(optimizer)
 
-                total_train_loss += total_loss_for_logging
-                
-                # MUDANÇA 4: As etapas de otimização acontecem DEPOIS do loop.
-                # O otimizador agora age sobre os gradientes acumulados de todas as tarefas do batch.
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                # PASSO E: Atualize o scaler para o próximo batch.
+                scaler.update()
+
                 scheduler.step()
                 
+                total_train_loss += total_loss_for_logging
                 progress_bar.set_postfix({'loss': total_loss_for_logging})
             
             avg_train_loss = total_train_loss / len(train_loader)
             print(f'Average training loss: {avg_train_loss:.4f}')
 
-            # MODIFICADO: Loop de Validação para múltiplas tarefas
+            # O loop de validação não precisa de scaler, pois não há retropropagação.
+            # Ele pode se beneficiar do `autocast` para ser mais rápido e usar menos memória.
             model.eval()
-            # Dicionários para armazenar acertos e totais por tarefa
             correct_predictions = defaultdict(int)
             total_predictions = defaultdict(int)
             
@@ -317,7 +336,8 @@ def main():
                     labels = batch['labels'].to(DEVICE)
                     task_ids = batch['task_ids'].to(DEVICE)
 
-                    logits = model(input_ids=input_ids, attention_mask=attention_mask, task_ids=task_ids)
+                    with autocast(device_type='cuda'):
+                        logits = model(input_ids=input_ids, attention_mask=attention_mask, task_ids=task_ids)
                     
                     # Calcula acurácia para cada tarefa presente no batch
                     for task_id_val in torch.unique(task_ids):
