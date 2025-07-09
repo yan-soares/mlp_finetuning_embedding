@@ -1,20 +1,13 @@
 import torch
-from transformers import AutoTokenizer
-from train_gemini_multitask import CustomClassifier
+from train_multitask import CustomClassifier
 import senteval
-from transformers import AutoTokenizer, DebertaV2Model, DebertaV2Tokenizer, BertTokenizer, BertModel, RobertaTokenizer, RobertaModel, AutoModel
-import torch
-import argparse
-import pandas as pd
+from transformers import DebertaV2Tokenizer
 import logging
-import os
-import functions_code
-from nltk.corpus import stopwords
 import numpy as np
 import argparse
 import pandas as pd
 import os
-import shutil
+import functions_code
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
@@ -79,8 +72,8 @@ def parse_dict_with_eval_other(value):
     except Exception as e:
         return {}
     
-def generate_tables_cl(final_df, path_atual, cl_file_name):
-    columns_tasks_cl = ['MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']
+def generate_tables_cl(final_df, path_atual, cl_file_name, tasks_cl):
+    columns_tasks_cl = tasks_cl
     main_colunas = ['pooling']
     ordem_colunas_cl = main_colunas + columns_tasks_cl        
 
@@ -164,7 +157,7 @@ def run_senteval(model_name, tasks, epochs, nhid_number, initial_layer_args, fin
         all_task_classes = {"MR": 2, "CR": 2, "MPQA": 2, "SUBJ": 2, "SST2": 2, "TREC": 6, "MRPC": 2}
         training_task_config = {name: num_classes for name, num_classes in all_task_classes.items() if name != HELD_OUT_TASK}
 
-        MODEL_SAVE_PATH = f"/home/yansoares/pooling_paper_mlp/final_multitask_training_models_new_03072025/model_exclude_{HELD_OUT_TASK}.bin"
+        MODEL_SAVE_PATH = f"/home/yansoares/mlp_finetuning_embedding_models/review/model_exclude_{HELD_OUT_TASK}.bin"
 
         print("Carregando o modelo e o tokenizador...")
         
@@ -231,7 +224,7 @@ def tasks_run(models_args, epochs_args, nhid_args, main_path, initial_layer_args
                     
     final_df = pd.DataFrame(results_data)
     final_df.to_csv(path_created + '/' + filename_task + '.csv', index=False)
-    generate_tables_cl(path_created + '/' + filename_task + '.csv', path_created, filename_task)
+    generate_tables_cl(path_created + '/' + filename_task + '.csv', path_created, filename_task, tasks_list)
 
 def main():
     parser = argparse.ArgumentParser(description="SentEval Experiments")
@@ -244,8 +237,8 @@ def main():
     parser.add_argument("--nhid", type=int, default=0, help="Numero de camadas ocultas (0 = Logistic Regression, 1 ou mais = MLP)")
     parser.add_argument("--initial_layer", type=int, default=0, help="Camada inicial para execução dos experimentos (default metade superior)")
     parser.add_argument("--final_layer", type=int, default=12, help="Camada inicial para execução dos experimentos (default metade superior)")
-    parser.add_argument("--poolings", type=str, default="all", help="Poolings separados por virgula (sem espacos) ou simple, simple-ns, two, three")
-    parser.add_argument("--agg_layers", type=str, default="ALL", help="agg layers separados por virgula (sem espacos)")
+    parser.add_argument("--poolings", type=str, default="multitask", help="Poolings separados por virgula (sem espacos) ou simple, simple-ns, two, three")
+    parser.add_argument("--agg_layers", type=str, default="teste_antes_terminar", help="agg layers separados por virgula (sem espacos)")
     parser.add_argument("--tasks", type=str, help="tasks separados por virgula (sem espacos)")
     parser.add_argument("--save_embeddings", type=int, default=0, help="1 - yes, 0 - no")
     args = parser.parse_args()
@@ -263,12 +256,12 @@ def main():
     agg_layers_args = args.agg_layers.split(",")  
     save_embeddings = int(args.save_embeddings)
 
-    main_path = '../pooling_paper_results/main_experiments_tables_03072025'   
+    main_path = 'results_tables'   
 
     initial_layer_args_print = args.initial_layer if args.initial_layer is not None else "default"
     final_layer_args_print = args.final_layer if args.final_layer is not None else "default"
 
-    filename_task = ('_models_' + '&'.join([st for st in models_args]) + 
+    '''filename_task = ('_models_' + '&'.join([st for st in models_args]) + 
                      '_epochs_' + str(epochs_args) + 
                      '_batch_' + str(batch_args) +
                      '_kfold_' + str(kfold_args) +
@@ -278,11 +271,21 @@ def main():
                      '_finallayer_' + str(final_layer_args_print) +
                      '_pooling_' + '&'.join([st for st in poolings_args]) + 
                      '_agglayers_' + '&'.join([st for st in agg_layers_args])
+                     )'''
+    filename_task = ('_models_' + '&'.join([st for st in models_args]) + 
+                     '_epochs_' + str(epochs_args) + 
+                     '_batch_' + str(batch_args) +
+                     '_kfold_' + str(kfold_args) +
+                     '_optim_' + str(optim_args) +
+                     '_nhid_' + str(nhid_args) + 
+                     '_pooling_' + '&'.join([st for st in poolings_args]) + 
+                     '_agglayers_' + '&'.join([st for st in agg_layers_args])
                      )
 
     if task_type_args == "classification":      
         filename_cl = "cl" + filename_task
-        classification_tasks = ['MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']        
+        #classification_tasks = ['MR', 'CR', 'SUBJ', 'MPQA', 'SST2', 'TREC', 'MRPC']        
+        classification_tasks = ['MR', 'CR']
         classification_tasks = args.tasks.split(",") if args.tasks is not None else classification_tasks
         tasks_run(models_args, epochs_args, nhid_args, main_path, initial_layer_args, final_layer_args, poolings_args, agg_layers_args, filename_cl, classification_tasks, 'cl', batch_args, optim_args, kfold_args, save_embeddings)
 

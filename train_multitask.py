@@ -20,10 +20,11 @@ DATA_PATH = "/home/yansoares/mlp_finetuning_embedding/data/downstream"
 MODEL_NAME = "microsoft/deberta-v3-base" 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 32
+NUM_WORKERS = 6
 EPOCHS = 50
 MAX_LEN = 512 
 LEARNING_RATE = 2e-5
-EARLY_STOPPING_PATIENCE = 5
+EARLY_STOPPING_PATIENCE = 3
 SAVE_DIR = "/home/yansoares/mlp_finetuning_embedding_models/review"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -211,8 +212,13 @@ class MultitaskDataset(Dataset):
             'task_ids': torch.tensor(task_id, dtype=torch.long) # NOVO: Retorna o ID da tarefa
         }
 
+
+# Adicione estas importações no início do seu script
+import pandas as pd
+import matplotlib.pyplot as plt
+
 # ===================================================================
-# ===== MAIN TRAINING SCRIPT (MODIFICADO PARA MULTITASK) =====
+# ===== MAIN TRAINING SCRIPT (COM LOGGING E PLOTAGEM) =====
 # ===================================================================
 
 def main():
@@ -232,25 +238,19 @@ def main():
     for held_out_task in datasets_raw:
         print(f"\n{'='*25}\n🔁 Treinando com exclusão de: {held_out_task}\n{'='*25}")
 
-        # MODIFICADO: Prepara os dados para o formato multitask
         train_tasks_data = {name: data for name, data in datasets_raw.items() if name != held_out_task}
-        
-        # MODIFICADO: Cria o dicionário de configuração para o modelo
         train_tasks_config = {name: len(set(labels)) for name, (texts, labels) in train_tasks_data.items()}
         print(f"Tarefas de treinamento: {train_tasks_config}")
 
-        # MODIFICADO: Usa o MultitaskDataset
         full_dataset = MultitaskDataset(train_tasks_data, tokenizer, MAX_LEN)
         
-        # Separando treino e validação
         val_size = int(len(full_dataset) * 0.2)
         train_size = len(full_dataset) - val_size
         train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=4)
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
 
-        # MODIFICADO: Instancia o modelo com a configuração das tarefas
         model = CustomClassifier(model_name=MODEL_NAME, task_config=train_tasks_config).to(DEVICE)
         
         optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
@@ -258,127 +258,149 @@ def main():
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
         criterion = nn.CrossEntropyLoss().to(DEVICE)
         
-        # PASSO A: Inicialize o GradScaler.
         scaler = GradScaler()
 
-        best_avg_val_accuracy = 0.0
+        best_val_loss = float('inf')
         epochs_no_improve = 0
         
         id_to_task_name_map = model.id_to_task_name
         
+        # NOVO: Lista para guardar o histórico de perdas para logging e plotagem
+        training_history = []
+        
         for epoch in range(EPOCHS):
             print(f'\n--- Epoch {epoch + 1}/{EPOCHS} ---')
+            
+            # NOVO: Dicionário para guardar os dados da época atual
+            epoch_data = {'epoch': epoch + 1}
+            
+            # --- Loop de Treinamento ---
             model.train()
             total_train_loss = 0
-            
+            per_task_train_losses = defaultdict(list) # NOVO: Guarda as perdas de treino por tarefa
+
             progress_bar = tqdm(train_loader, desc="Training", leave=False)
             for batch in progress_bar:
-                input_ids = batch['input_ids'].to(DEVICE)
-                attention_mask = batch['attention_mask'].to(DEVICE)
-                labels = batch['labels'].to(DEVICE)
-                task_ids = batch['task_ids'].to(DEVICE)
-
+                # ... (código do batch de treino) ...
+                input_ids, attention_mask, labels, task_ids = batch['input_ids'].to(DEVICE), batch['attention_mask'].to(DEVICE), batch['labels'].to(DEVICE), batch['task_ids'].to(DEVICE)
                 optimizer.zero_grad()
                 
-                # PASSO B: O contexto autocast envolve a chamada do modelo.
                 with autocast(device_type='cuda'):
                     logits = model(input_ids=input_ids, attention_mask=attention_mask, task_ids=task_ids)
-                    
-                    # Lógica do loop de tarefas
                     unique_task_ids = torch.unique(task_ids)
                     num_unique_tasks = len(unique_task_ids)
-                    total_loss_for_logging = 0
+                    batch_loss = 0
 
                     for i, task_id_val in enumerate(unique_task_ids):
                         task_mask = (task_ids == task_id_val)
-                        
-                        # O cálculo da perda da tarefa também deve estar dentro do autocast
-                        task_logits_full = logits[task_mask]
                         task_labels = labels[task_mask]
-                        
-                        num_classes_for_task = train_tasks_config[id_to_task_name_map[task_id_val.item()]]
-                        task_logits_sliced = task_logits_full[:, :num_classes_for_task]
+                        task_name = id_to_task_name_map[task_id_val.item()]
+                        num_classes_for_task = train_tasks_config[task_name]
+                        task_logits_sliced = logits[task_mask][:, :num_classes_for_task]
                         
                         loss_per_task = criterion(task_logits_sliced, task_labels)
                         
-                        total_loss_for_logging += loss_per_task.item()
+                        # NOVO: Registra a perda para a tarefa específica
+                        per_task_train_losses[task_name].append(loss_per_task.item())
                         
-                        # PASSO C: Escale a perda da TAREFA ATUAL e faça o backward.
-                        # A lógica de `retain_graph` é mantida.
+                        batch_loss += loss_per_task.item()
                         retain_graph_needed = (i < num_unique_tasks - 1)
                         scaler.scale(loss_per_task).backward(retain_graph=retain_graph_needed)
 
-                # PASSO D: Fora do loop de tarefas, mas dentro do loop do batch.
-                # Otimize os pesos usando os gradientes acumulados de todas as tarefas.
                 scaler.step(optimizer)
-
-                # PASSO E: Atualize o scaler para o próximo batch.
                 scaler.update()
-
                 scheduler.step()
-                
-                total_train_loss += total_loss_for_logging
-                progress_bar.set_postfix({'loss': total_loss_for_logging})
+                total_train_loss += batch_loss
+                progress_bar.set_postfix({'loss': batch_loss})
             
             avg_train_loss = total_train_loss / len(train_loader)
+            epoch_data['avg_train_loss'] = avg_train_loss # NOVO: Salva a perda média de treino
+            for task, losses in per_task_train_losses.items():
+                epoch_data[f'train_loss_{task}'] = np.mean(losses) # NOVO: Salva a perda de treino por tarefa
             print(f'Average training loss: {avg_train_loss:.4f}')
 
-            # O loop de validação não precisa de scaler, pois não há retropropagação.
-            # Ele pode se beneficiar do `autocast` para ser mais rápido e usar menos memória.
+            # --- Loop de Validação ---
             model.eval()
-            correct_predictions = defaultdict(int)
-            total_predictions = defaultdict(int)
+            total_val_loss = 0
+            per_task_val_losses = defaultdict(list) # NOVO: Guarda as perdas de validação por tarefa
             
             with torch.no_grad():
                 for batch in tqdm(val_loader, desc="Validation", leave=False):
-                    input_ids = batch['input_ids'].to(DEVICE)
-                    attention_mask = batch['attention_mask'].to(DEVICE)
-                    labels = batch['labels'].to(DEVICE)
-                    task_ids = batch['task_ids'].to(DEVICE)
+                    # ... (código do batch de validação) ...
+                    input_ids, attention_mask, labels, task_ids = batch['input_ids'].to(DEVICE), batch['attention_mask'].to(DEVICE), batch['labels'].to(DEVICE), batch['task_ids'].to(DEVICE)
 
                     with autocast(device_type='cuda'):
                         logits = model(input_ids=input_ids, attention_mask=attention_mask, task_ids=task_ids)
-                    
-                    # Calcula acurácia para cada tarefa presente no batch
-                    for task_id_val in torch.unique(task_ids):
-                        task_mask = (task_ids == task_id_val)
-                        task_name = id_to_task_name_map[task_id_val.item()]
-                        num_classes_for_task = train_tasks_config[task_name]
-                        
-                        task_logits = logits[task_mask][:, :num_classes_for_task]
-                        task_labels = labels[task_mask]
-                        
-                        _, preds = torch.max(task_logits, dim=1)
-                        
-                        correct_predictions[task_name] += torch.sum(preds == task_labels).item()
-                        total_predictions[task_name] += task_labels.size(0)
+                        unique_task_ids = torch.unique(task_ids)
+                        batch_val_loss = 0
+                        for task_id_val in unique_task_ids:
+                            task_mask = (task_ids == task_id_val)
+                            task_name = id_to_task_name_map[task_id_val.item()]
+                            num_classes_for_task = train_tasks_config[task_name]
+                            task_logits = logits[task_mask][:, :num_classes_for_task]
+                            task_labels = labels[task_mask]
+                            
+                            loss_per_task = criterion(task_logits, task_labels)
+                            
+                            # NOVO: Registra a perda de validação para a tarefa específica
+                            per_task_val_losses[task_name].append(loss_per_task.item())
+                            
+                            batch_val_loss += loss_per_task.item()
+                        total_val_loss += batch_val_loss
 
-            # Calcula e imprime a acurácia por tarefa e a média
-            task_accuracies = {name: correct / total if total > 0 else 0 
-                               for name, correct, total in 
-                               ((n, correct_predictions[n], total_predictions[n]) for n in train_tasks_config.keys())}
+            avg_val_loss = total_val_loss / len(val_loader)
+            epoch_data['avg_val_loss'] = avg_val_loss # NOVO: Salva a perda média de validação
+            for task, losses in per_task_val_losses.items():
+                epoch_data[f'val_loss_{task}'] = np.mean(losses) # NOVO: Salva a perda de validação por tarefa
+            print(f'Average Validation Loss: {avg_val_loss:.4f}')
+            
+            # ... (código de impressão de acurácia, pode ser mantido se desejar) ...
 
-            for name, acc in task_accuracies.items():
-                print(f'  - Val Accuracy for {name}: {acc:.4f}')
-            
-            avg_val_accuracy = np.mean(list(task_accuracies.values()))
-            print(f'Average Validation Accuracy: {avg_val_accuracy:.4f}')
-            
-            # Lógica do Early Stopping baseada na acurácia média
-            if avg_val_accuracy > best_avg_val_accuracy:
-                best_avg_val_accuracy = avg_val_accuracy
+            # NOVO: Adiciona todos os dados da época ao histórico
+            training_history.append(epoch_data)
+
+            # --- Lógica do Early Stopping (baseada na perda) ---
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
                 epochs_no_improve = 0
                 output_path = os.path.join(SAVE_DIR, f"model_exclude_{held_out_task}.bin")
                 torch.save(model.state_dict(), output_path)
-                print(f"✅ Melhoria na acurácia média! Melhor modelo salvo com {best_avg_val_accuracy:.4f} em: {output_path}")
+                print(f"✅ Melhoria na perda de validação! Melhor modelo salvo com loss {best_val_loss:.4f} em: {output_path}")
             else:
                 epochs_no_improve += 1
-                print(f"Sem melhoria na acurácia média por {epochs_no_improve} épocas.")
+                print(f"Sem melhoria na perda de validação por {epochs_no_improve} épocas.")
 
             if epochs_no_improve >= EARLY_STOPPING_PATIENCE:
                 print(f"\n✋ Early stopping acionado após {EARLY_STOPPING_PATIENCE} épocas sem melhoria.")
-                print(f"Melhor acurácia média de validação obtida: {best_avg_val_accuracy:.4f}")
+                print(f"Melhor perda de validação obtida: {best_val_loss:.4f}")
                 break
+        
+        # --- NOVO: SEÇÃO DE LOGGING E PLOTAGEM ---
+        # Executa ao final do treino para o modelo atual (seja por early stopping ou por completar as épocas)
+        if training_history:
+            print("\n📊 Gerando log e gráfico de perdas...")
+            
+            # 1. Salvar dados em CSV
+            df = pd.DataFrame(training_history)
+            log_path = os.path.join(SAVE_DIR, f"log_exclude_{held_out_task}.csv")
+            df.to_csv(log_path, index=False)
+            print(f"📈 Log de treinamento salvo em: {log_path}")
+
+            # 2. Gerar e salvar o gráfico de perdas
+            plt.figure(figsize=(12, 6))
+            plt.plot(df['epoch'], df['avg_train_loss'], label='Perda Média de Treino', color='blue', marker='o')
+            plt.plot(df['epoch'], df['avg_val_loss'], label='Perda Média de Validação', color='red', marker='o')
+            plt.title(f'Perda de Treino e Validação (Excluindo: {held_out_task})')
+            plt.xlabel('Época')
+            plt.ylabel('Perda (Loss)')
+            plt.xticks(df['epoch'])
+            plt.legend()
+            plt.grid(True)
+            
+            plot_path = os.path.join(SAVE_DIR, f"loss_plot_exclude_{held_out_task}.png")
+            plt.savefig(plot_path)
+            plt.close() # Fecha a figura para liberar memória
+            print(f"🖼️ Gráfico de perdas salvo em: {plot_path}")
 
 if __name__ == "__main__":
     main()
